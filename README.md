@@ -24,6 +24,24 @@ bash ./run.sh
   into text; it is used to modulate CFG weights along the diffusion path.
 - Optional quantized loading: `--cot_load_in_8bit` / `--cot_load_in_4bit` (requires bitsandbytes).
 
+## Multi-resolution auxiliary loss (minimal change enhancement)
+Introduce a lightweight, multi-horizon supervision term inspired by multi-resolution forecasting:
+the model is encouraged to fit several horizons (e.g., {1, 3, 6, 12}) within the prediction window.
+This adds training signal without changing the model architecture.
+- Config keys (under `train`):
+  - `multi_res_horizons`: list of horizons to supervise (clipped by `pred_len`).
+  - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
+  - `multi_res_use_huber`: use Huber loss (recommended for stability).
+  - `multi_res_huber_delta`: delta for Huber loss.
+- Example (YAML):
+  ```yaml
+  train:
+    multi_res_horizons: [1, 3, 6, 12]
+    multi_res_loss_weight: 0.1
+    multi_res_use_huber: true
+    multi_res_huber_delta: 1.0
+  ```
+
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
 - Stage-1: reuse the original one-shot query to retrieve E0.

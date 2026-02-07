@@ -95,6 +95,16 @@ class CSDI_base(nn.Module):
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
 
+        train_cfg = config.get("train", {})
+        self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
+        self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
+        self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
+        self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        if isinstance(self.multi_res_horizons, int):
+            self.multi_res_horizons = [self.multi_res_horizons]
+        elif self.multi_res_horizons is None:
+            self.multi_res_horizons = []
+
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
             self.emb_total_dim += 1 
@@ -290,7 +300,49 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
+            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask)
+            loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
+
+    def _calc_multi_res_loss(self, observed_data, predicted, target_mask):
+        if self.pred_len <= 0:
+            return torch.zeros((), device=observed_data.device)
+        horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
+        if len(horizons) == 0:
+            return torch.zeros((), device=observed_data.device)
+        max_pred = int(self.pred_len)
+        horizons = [min(h, max_pred) for h in horizons]
+        loss_sum = 0.0
+        count = 0
+        for h in horizons:
+            if h <= 0:
+                continue
+            horizon_mask = torch.zeros_like(target_mask)
+            start = int(self.lookback_len)
+            end = int(self.lookback_len + h)
+            horizon_mask[:, :, start:end] = 1.0
+            horizon_mask = horizon_mask * target_mask
+            num_eval = horizon_mask.sum()
+            if num_eval <= 0:
+                continue
+            residual = (observed_data - predicted) * horizon_mask
+            if self.multi_res_use_huber:
+                delta = self.multi_res_huber_delta
+                abs_res = residual.abs()
+                huber = torch.where(
+                    abs_res <= delta,
+                    0.5 * residual ** 2,
+                    delta * abs_res - 0.5 * (delta ** 2),
+                )
+                loss_h = huber.sum() / num_eval
+            else:
+                loss_h = (residual ** 2).sum() / num_eval
+            loss_sum += loss_h
+            count += 1
+        if count == 0:
+            return torch.zeros((), device=observed_data.device)
+        return loss_sum / count
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
