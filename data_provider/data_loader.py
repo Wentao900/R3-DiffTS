@@ -58,7 +58,8 @@ class Dataset_Custom(Dataset):
                  cot_cache_size=1024, cot_device=None, rag_use_retrieval=True,
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
-                 two_stage_gate=True, trend_slope_eps=1e-3):
+                 two_stage_gate=True, trend_slope_eps=1e-3,
+                 dynamic_text_len=False, dynamic_text_lens=None, scale_aware_rag=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -78,6 +79,9 @@ class Dataset_Custom(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.text_len = text_len
+        self.dynamic_text_len = bool(dynamic_text_len)
+        self.dynamic_text_lens = self._resolve_dynamic_text_lens(dynamic_text_lens)
+        self.scale_aware_rag = bool(scale_aware_rag)
         self.max_text_tokens = max_text_tokens
         self.text_drop_prob = text_drop_prob
         self.use_rag_cot = use_rag_cot
@@ -136,6 +140,7 @@ class Dataset_Custom(Dataset):
                 rag_stage2_topk=self.rag_stage2_topk,
                 two_stage_gate=self.two_stage_gate,
                 trend_slope_eps=self.trend_slope_eps,
+                scale_aware_rag=self.scale_aware_rag,
             )
             self.rag_cot = RAGCoTPipeline(
                 domain=self.domain,
@@ -147,7 +152,66 @@ class Dataset_Custom(Dataset):
             )
         else:
             self.rag_cot = None
-        
+    def _resolve_dynamic_text_lens(self, dynamic_text_lens):
+        if dynamic_text_lens is None:
+            short_len = max(4, min(self.seq_len, max(self.pred_len // 2, 1)))
+            mid_len = max(short_len, min(self.seq_len, max(self.pred_len, self.text_len // 2)))
+            long_len = max(mid_len, min(self.seq_len, max(self.text_len, self.pred_len)))
+            candidates = [short_len, mid_len, long_len]
+        elif isinstance(dynamic_text_lens, int):
+            candidates = [int(dynamic_text_lens)]
+        else:
+            candidates = [int(item) for item in dynamic_text_lens]
+        resolved = []
+        for item in candidates:
+            clipped = min(max(int(item), 1), int(self.seq_len))
+            if clipped not in resolved:
+                resolved.append(clipped)
+        if not resolved:
+            resolved = [min(max(int(self.text_len), 1), int(self.seq_len))]
+        return resolved
+
+    def _infer_scale_profile(self, seq_x):
+        arr = np.asarray(seq_x, dtype=np.float32).reshape(-1)
+        if arr.size <= 1:
+            return {
+                'scale_pref': 0.5,
+                'scale_label': 'mid',
+                'text_len': int(self.dynamic_text_lens[min(len(self.dynamic_text_lens) - 1, 0)]),
+            }
+        slope = float(abs(arr[-1] - arr[0]) / max(arr.size - 1, 1))
+        std = float(np.std(arr))
+        mean_abs = float(np.mean(np.abs(arr)))
+        total_shift = float(abs(arr[-1] - arr[0]))
+        if arr.size > 2:
+            accel = float(np.mean(np.abs(np.diff(arr, n=2))))
+        else:
+            accel = 0.0
+        smoothness = 1.0 / (1.0 + accel / (slope + 1e-6))
+        trend_score = (total_shift / (std + 1e-6)) * smoothness
+        volatility_score = std / (mean_abs + 1e-6) + accel / (std + 1e-6)
+        scale_pref = trend_score / (trend_score + volatility_score + 1e-6)
+
+        num_levels = len(self.dynamic_text_lens)
+        if num_levels <= 1:
+            scale_index = 0
+        else:
+            scale_index = int(np.clip(np.floor(scale_pref * num_levels), 0, num_levels - 1))
+            if scale_pref >= 1.0:
+                scale_index = num_levels - 1
+        if num_levels == 1:
+            scale_label = 'mid'
+        else:
+            labels = ['short', 'mid', 'long']
+            scale_label = labels[min(scale_index, len(labels) - 1)]
+            if num_levels == 2:
+                scale_label = 'short' if scale_index == 0 else 'long'
+        return {
+            'scale_pref': scale_pref,
+            'scale_label': scale_label,
+            'text_len': int(self.dynamic_text_lens[scale_index]),
+        }
+
 
     def __read_data__(self):
         df_num = pd.read_csv(os.path.join(self.root_path, 'numerical', self.data_path))
@@ -238,6 +302,39 @@ class Dataset_Custom(Dataset):
             tokens = tokens[:self.max_text_tokens]
         all_txt = ' '.join(tokens)
         return all_txt, text_mark
+
+    def _build_guided_text(self, index, seq_x, text_begin, text_end, scale_label, text_dropped=False):
+        if text_dropped:
+            seq_x_txt, txt_mark = 'NA', 0
+            rag_retrieved, cot_text = '', ''
+        else:
+            seq_x_txt, txt_mark = self.collect_text(
+                self.num_dates.start_date[text_begin],
+                self.num_dates.end_date[text_end],
+            )
+            rag_retrieved, cot_text = '', ''
+            if self.use_rag_cot and self.rag_cot is not None:
+                cached = self.guidance_cache.get(index, None)
+                if cached is None:
+                    guidance = self.rag_cot.build_guidance_text(
+                        numeric_history=seq_x,
+                        start_date=self.num_dates.start_date[text_begin],
+                        end_date=self.num_dates.end_date[text_end - 1],
+                        base_text=seq_x_txt,
+                        scale_hint=scale_label if self.scale_aware_rag else None,
+                    )
+                    seq_x_txt = guidance["composed_text"]
+                    cot_text = guidance["cot_text"]
+                    rag_retrieved = guidance["retrieved_text"]
+                    txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
+                    self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
+                else:
+                    seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
+        if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
+            txt_mark = 0
+        trend_fields = build_trend_fields(cot_text, seq_x)
+        trend_prior = trend_fields_to_vector(trend_fields).astype(np.float32)
+        return seq_x_txt, np.int64(txt_mark), cot_text, rag_retrieved, trend_prior
     
     def __getitem__(self, index):
         s_begin = index
@@ -252,36 +349,23 @@ class Dataset_Custom(Dataset):
         seq_x_stamp = self.data_stamp[s_begin:s_end]
         seq_y_stamp = self.data_stamp[r_begin:r_end]
 
-        text_begin = s_end - self.text_len
+        scale_profile = self._infer_scale_profile(seq_x)
+        effective_text_len = int(scale_profile['text_len'] if self.dynamic_text_len else self.text_len)
+        effective_text_len = min(max(effective_text_len, 1), self.seq_len)
+        scale_label = scale_profile['scale_label']
+        text_begin = s_end - effective_text_len
         text_end = s_end
-
-        seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
-            seq_x_txt, txt_mark = 'NA', 0
             text_dropped = True
-        rag_retrieved, cot_text = '', ''
-        if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
-            cached = self.guidance_cache.get(index, None)
-            if cached is None:
-                guidance = self.rag_cot.build_guidance_text(
-                    numeric_history=seq_x,
-                    start_date=self.num_dates.start_date[text_begin],
-                    end_date=self.num_dates.end_date[text_end - 1],
-                    base_text=seq_x_txt,
-                )
-                seq_x_txt = guidance["composed_text"]
-                cot_text = guidance["cot_text"]
-                rag_retrieved = guidance["retrieved_text"]
-                txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
-                self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
-            else:
-                seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
-        if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
-            txt_mark = 0
-
-        trend_fields = build_trend_fields(cot_text, seq_x)
-        trend_prior = trend_fields_to_vector(trend_fields)
+        seq_x_txt, txt_mark, cot_text, rag_retrieved, trend_prior = self._build_guided_text(
+            index=index,
+            seq_x=seq_x,
+            text_begin=text_begin,
+            text_end=text_end,
+            scale_label=scale_label,
+            text_dropped=text_dropped,
+        )
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -299,7 +383,9 @@ class Dataset_Custom(Dataset):
             'text_mark': txt_mark,
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
-            'trend_prior': trend_prior
+            'trend_prior': trend_prior,
+            'scale_code': np.int64({'short': 0, 'mid': 1, 'long': 2}.get(scale_label, 1)),
+            'text_window_len': np.int64(effective_text_len),
         }
 
         return s

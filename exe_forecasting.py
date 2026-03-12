@@ -28,6 +28,9 @@ parser.add_argument('--pred_len', type=int, default=18, help='prediction sequenc
 parser.add_argument('--text_len', type=int, default=36, help='context length in time series freq')
 parser.add_argument('--max_text_tokens', type=int, default=256, help='max tokens kept per text window after cleanup')
 parser.add_argument('--text_drop_prob', type=float, default=0.0, help='probability to drop text during training/eval for robustness')
+parser.add_argument('--dynamic_text_len', action='store_true', help='adapt text window length per sample based on inferred time scale')
+parser.add_argument('--dynamic_text_lens', nargs='*', type=int, default=None, help='candidate text windows for short/mid/long scales')
+parser.add_argument('--scale_aware_rag', action='store_true', help='inject inferred time-scale hint into RAG queries and prompts')
 parser.add_argument('--use_rag_cot', action='store_true', help='enable retrieval-augmented CoT guidance text')
 parser.add_argument('--cot_only', action='store_true', help='disable retrieval; only generate CoT guidance text')
 parser.add_argument('--rag_topk', type=int, default=3, help='number of retrieved evidence snippets for RAG')
@@ -93,10 +96,49 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
+args.seq_len = int(config.get("seq_len", config.get("model", {}).get("lookback_len", args.seq_len)))
+args.pred_len = int(config.get("pred_len", config.get("model", {}).get("pred_len", args.pred_len)))
+args.text_len = int(config.get("text_len", config.get("model", {}).get("text_len", args.text_len)))
 # Force unified TAA + TTF path: always use texts, timestep embeddings, and timestep branch
 config["model"]["with_texts"] = True
 config["model"]["timestep_emb_cat"] = True
 config["model"]["timestep_branch"] = True
+train_cfg = config.setdefault("train", {})
+train_cfg.setdefault("multi_res_loss_weight", 0.0)
+train_cfg.setdefault("multi_res_use_huber", True)
+train_cfg.setdefault("multi_res_huber_delta", 1.0)
+if "multi_res_band_boundaries" not in train_cfg:
+    train_cfg["multi_res_band_boundaries"] = train_cfg.get("multi_res_horizons", [])
+if "multi_res_mode" not in train_cfg:
+    if train_cfg["multi_res_loss_weight"] > 0 and len(train_cfg.get("multi_res_band_boundaries", [])) > 0:
+        train_cfg["multi_res_mode"] = "static_band"
+    else:
+        train_cfg["multi_res_mode"] = "off"
+train_cfg.setdefault(
+    "multi_res_weight_mode",
+    "adaptive" if str(train_cfg["multi_res_mode"]).lower() == "dynamic_band" else "off",
+)
+train_cfg.setdefault("multi_res_weight_focus", "hard")
+train_cfg.setdefault("multi_res_weight_beta", 0.95)
+train_cfg.setdefault("multi_res_weight_temp", 1.0)
+train_cfg.setdefault("multi_res_weight_strength", 0.3)
+train_cfg.setdefault("multi_res_weight_alpha", 0.7)
+train_cfg.setdefault("multi_res_weight_floor", 0.15)
+train_cfg.setdefault("multi_res_weight_warmup_steps", 400)
+train_cfg.setdefault("use_scale_router", False)
+train_cfg.setdefault("scale_router_hidden_dim", 32)
+train_cfg.setdefault("scale_router_dropout", 0.1)
+train_cfg.setdefault("scale_router_temp", train_cfg.get("multi_res_weight_temp", 1.0))
+train_cfg.setdefault("scale_router_entropy_weight", 1.0e-3)
+train_cfg.setdefault("scale_router_use_trend_prior", True)
+train_cfg.setdefault("scale_router_use_text_mask", True)
+train_cfg.setdefault("scale_router_teacher_weight", 0.1)
+train_cfg.setdefault("scale_router_warmup_steps", train_cfg.get("multi_res_weight_warmup_steps", 400))
+args.dynamic_text_len = config["model"].get("dynamic_text_len", args.dynamic_text_len)
+cfg_dynamic_text_lens = config["model"].get("dynamic_text_lens", args.dynamic_text_lens)
+if cfg_dynamic_text_lens is not None:
+    args.dynamic_text_lens = list(cfg_dynamic_text_lens)
+args.scale_aware_rag = config["model"].get("scale_aware_rag", args.scale_aware_rag)
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)
@@ -143,6 +185,9 @@ config["model"]["lookback_len"] = args.seq_len
 config["model"]["pred_len"] = args.pred_len
 config["model"]["domain"] = args.data_path.split('/')[0]
 config["model"]["text_len"] = args.text_len
+config["model"]["dynamic_text_len"] = args.dynamic_text_len
+config["model"]["dynamic_text_lens"] = args.dynamic_text_lens
+config["model"]["scale_aware_rag"] = args.scale_aware_rag
 config["model"]["save_attn"] = args.save_attn
 config["model"]["save_token"] = args.save_token
 config["diffusion"]["dropout"] = args.dropout
@@ -213,26 +258,80 @@ if args.modelfolder == "":
         foldername=foldername,
         valid_epoch_interval=args.valid_interval
     )
+    model_folder = foldername
 else:
-    model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
+    model_folder = os.path.join("./save", args.modelfolder)
+    model.load_state_dict(torch.load(os.path.join(model_folder, "model.pth"), map_location=args.device))
 model.target_dim = target_dim
 if config["diffusion"]["cfg"]:
-    best_mse = 10e10
-    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
-    for guide_w in guide_list:
-        mse = evaluate(
-            model,
-            test_loader,
-            nsample=args.nsample,
-            scaler=scaler,
-            mean_scaler=mean_scaler,
-            foldername=foldername,
-            window_lens=[args.seq_len, args.pred_len],
-            guide_w=guide_w,
-            save_attn=args.save_attn,
-            save_token=args.save_token,
-            save_trend_prior=args.save_trend_prior
-        )
+    default_guide_list = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
+    guide_list = [args.guide_w] if args.guide_w >= 0 else config["model"].get("guide_w_candidates", default_guide_list)
+    if args.guide_w >= 0:
+        selected_guide_w = args.guide_w
+        selection_info = {
+            "selection_split": "manual",
+            "selected_guide_w": selected_guide_w,
+            "candidates": guide_list,
+        }
+    else:
+        fallback_guide = float(config["model"].get("guide_w_default", guide_list[0]))
+        if valid_loader is None:
+            selected_guide_w = fallback_guide
+            selection_info = {
+                "selection_split": "fallback_default",
+                "selected_guide_w": selected_guide_w,
+                "candidates": guide_list,
+            }
+        else:
+            best_mse = float("inf")
+            selected_guide_w = fallback_guide
+            val_scores = {}
+            for guide_w in guide_list:
+                mse = evaluate(
+                    model,
+                    valid_loader,
+                    nsample=args.nsample,
+                    scaler=scaler,
+                    mean_scaler=mean_scaler,
+                    foldername=foldername,
+                    model_folder=model_folder,
+                    window_lens=[args.seq_len, args.pred_len],
+                    guide_w=guide_w,
+                    save_attn=args.save_attn,
+                    save_token=args.save_token,
+                    save_trend_prior=False,
+                    split="valid",
+                    append_to_config_results=False,
+                )
+                val_scores[str(guide_w)] = mse
+                if mse < best_mse:
+                    best_mse = mse
+                    selected_guide_w = guide_w
+            selection_info = {
+                "selection_split": "valid",
+                "selected_guide_w": selected_guide_w,
+                "best_valid_mse": best_mse,
+                "candidates": guide_list,
+                "valid_scores": val_scores,
+            }
+    with open(os.path.join(foldername, "selected_guide_w.json"), "w") as f:
+        json.dump(selection_info, f, indent=4)
+    evaluate(
+        model,
+        test_loader,
+        nsample=args.nsample,
+        scaler=scaler,
+        mean_scaler=mean_scaler,
+        foldername=foldername,
+        model_folder=model_folder,
+        window_lens=[args.seq_len, args.pred_len],
+        guide_w=selected_guide_w,
+        save_attn=args.save_attn,
+        save_token=args.save_token,
+        save_trend_prior=args.save_trend_prior,
+        split="test",
+        append_to_config_results=True,
+    )
 else:
     evaluate(
             model,
@@ -241,8 +340,12 @@ else:
             scaler=scaler,
             mean_scaler=mean_scaler,
             foldername=foldername,
+            model_folder=model_folder,
             window_lens=[args.seq_len, args.pred_len],
+            guide_w=0.0,
             save_attn=args.save_attn,
             save_token=args.save_token,
-            save_trend_prior=args.save_trend_prior
+            save_trend_prior=args.save_trend_prior,
+            split="test",
+            append_to_config_results=True,
         )
