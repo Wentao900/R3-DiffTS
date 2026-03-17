@@ -9,6 +9,8 @@ pip install -r requirements.txt
 ## Datasets
 Public benchmark: [Time-MMD](https://github.com/adityalab/time-mmd)
 
+> Note: the repository contains configs and runnable paths for multiple datasets, but the current experiment comparisons and metric-based analysis reported in this repo are only validated on `Economy`. Other datasets should be treated as reusable capabilities/examples unless a separate report states otherwise.
+
 ## Experiment
 ```bash
 bash ./run.sh
@@ -70,6 +72,7 @@ CoT is promoted from a text condition to a diffusion-path modulation signal.
 - To override, pass a fixed `--guide_w` or run your own loop.
 
 ## Current Economy V2 baseline
+- Scope boundary: the current comparison tables, guide-weight selection results, and metric interpretation in this repository are for `Economy` only.
 - Active config: `config/economy_36_12_scale_router_guide.yaml`
 - Task setup: `seq_len=36`, `pred_len=12`, `text_len=36`, `freq=m`
 - Current report only records validation-time guide selection, not test metrics.
@@ -109,7 +112,9 @@ Notes:
 ## Debug
 Use `debug_two_stage_rag.py` to inspect Q1/E0/z0/Q2/E1 and the composed text preview.
 
-## Full command example
+## Additional runnable example
+This section is only a capability example. It is not part of the current reported `Economy` comparison results.
+
 ```bash
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \

@@ -9,9 +9,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_RETRIEVER_AVAILABLE = True
+except ImportError:
+    TfidfVectorizer = None
+    cosine_similarity = None
+    SKLEARN_RETRIEVER_AVAILABLE = False
 
 
 @dataclass
@@ -34,6 +41,7 @@ class RAGCoTConfig:
     rag_stage2_topk: int = -1
     two_stage_gate: bool = True
     trend_slope_eps: float = 1e-3
+    scale_aware_rag: bool = False
     debug: bool = False
 
 
@@ -62,6 +70,7 @@ class RAGCoTPipeline:
         self.use_two_stage_rag = bool(self.config.use_two_stage_rag)
         self.two_stage_gate = bool(self.config.two_stage_gate)
         self.trend_slope_eps = float(self.config.trend_slope_eps)
+        self.scale_aware_rag = bool(self.config.scale_aware_rag)
         self.debug = bool(self.config.debug)
         self.rag_stage2_topk = self._resolve_stage2_topk(self.config.rag_stage2_topk)
         self.rag_stage1_topk = self._resolve_stage1_topk(self.config.rag_stage1_topk, self.rag_stage2_topk)
@@ -95,9 +104,16 @@ class RAGCoTPipeline:
     def _fit_retriever(self, search_df: pd.DataFrame) -> Optional[Dict[str, object]]:
         if search_df.empty or not self.config.use_retrieval:
             return None
-        vectorizer = TfidfVectorizer(stop_words="english", max_features=4096, ngram_range=(1, 2))
-        matrix = vectorizer.fit_transform(search_df["fact"].tolist())
-        return {"vectorizer": vectorizer, "matrix": matrix}
+        if SKLEARN_RETRIEVER_AVAILABLE:
+            vectorizer = TfidfVectorizer(stop_words="english", max_features=4096, ngram_range=(1, 2))
+            matrix = vectorizer.fit_transform(search_df["fact"].tolist())
+            return {"vectorizer": vectorizer, "matrix": matrix, "mode": "tfidf"}
+        token_docs = [set(self._simple_tokenize(text)) for text in search_df["fact"].tolist()]
+        warnings.warn("scikit-learn is not installed; falling back to overlap-based retrieval.")
+        return {"token_docs": token_docs, "mode": "overlap"}
+
+    def _simple_tokenize(self, text: str) -> List[str]:
+        return re.findall(r"[A-Za-z0-9_]+", text.lower())
 
     def _init_generator(self, config: RAGCoTConfig):
         if config.cot_model is None:
@@ -151,10 +167,20 @@ class RAGCoTPipeline:
         k = self.config.top_k if top_k is None else int(top_k)
         if not self.retriever or not self.config.use_retrieval or k <= 0:
             return []
-        query_vec = self.retriever["vectorizer"].transform([query_text])
-        sims = cosine_similarity(query_vec, self.retriever["matrix"]).ravel()
-        if sims.size == 0:
-            return []
+        if self.retriever.get("mode") == "overlap":
+            query_tokens = set(self._simple_tokenize(query_text))
+            sims = np.asarray(
+                [
+                    len(query_tokens & doc_tokens) / max(len(query_tokens | doc_tokens), 1)
+                    for doc_tokens in self.retriever["token_docs"]
+                ],
+                dtype=float,
+            )
+        else:
+            query_vec = self.retriever["vectorizer"].transform([query_text])
+            sims = cosine_similarity(query_vec, self.retriever["matrix"]).ravel()
+            if sims.size == 0:
+                return []
         top_idx = sims.argsort()[::-1][:k]
         return [
             self.search_df.iloc[i].fact
@@ -191,15 +217,39 @@ class RAGCoTPipeline:
         mean_abs = float(np.mean(np.abs(arr)))
         return {"slope": slope, "std": std, "mean_abs": mean_abs, "mean": mean}
 
+    def _normalize_scale_hint(self, scale_hint: Optional[str]) -> str:
+        value = (scale_hint or "").strip().lower()
+        if value in {"short", "short-term", "short_term"}:
+            return "short"
+        if value in {"mid", "medium", "medium-term", "mid-term", "mid_term"}:
+            return "mid"
+        if value in {"long", "long-term", "long_term"}:
+            return "long"
+        return ""
+
+    def _format_scale_hint(self, scale_hint: Optional[str]) -> str:
+        normalized = self._normalize_scale_hint(scale_hint)
+        if normalized == "short":
+            return "short-term dynamics"
+        if normalized == "mid":
+            return "medium-term transition"
+        if normalized == "long":
+            return "long-term trend"
+        return ""
+
     def _format_prompt(
         self,
         numeric_summary: str,
         retrieved: List[str],
+        scale_hint: Optional[str] = None,
     ) -> str:
         evidence = "\n".join([f"- {item}" for item in retrieved]) if retrieved else "No extra evidence."
+        scale_text = self._format_scale_hint(scale_hint)
+        scale_line = f"Forecast focus: {scale_text}\n" if scale_text else ""
         if self.config.structured_output:
             return (
                 f"{self.desc}\n"
+                f"{scale_line}"
                 f"Historical summary (lookback {self.lookback_len}): {numeric_summary}\n"
                 f"Retrieved evidence:\n{evidence}\n"
                 "Return only a JSON object with keys: "
@@ -210,16 +260,20 @@ class RAGCoTPipeline:
             )
         return (
             f"{self.desc}\n"
+            f"{scale_line}"
             f"Historical summary (lookback {self.lookback_len}): {numeric_summary}\n"
             f"Retrieved evidence:\n{evidence}\n"
             f"Reason step by step to sketch an intermediate trend for the next {self.pred_len} steps "
             f"before a final forecast."
         )
 
-    def _format_trend_prompt(self, numeric_summary: str, retrieved: List[str]) -> str:
+    def _format_trend_prompt(self, numeric_summary: str, retrieved: List[str], scale_hint: Optional[str] = None) -> str:
         evidence = "\n".join([f"- {item}" for item in retrieved]) if retrieved else "No extra evidence."
+        scale_text = self._format_scale_hint(scale_hint)
+        scale_line = f"Forecast focus: {scale_text}\n" if scale_text else ""
         return (
             f"{self.desc}\n"
+            f"{scale_line}"
             f"Historical summary (lookback {self.lookback_len}): {numeric_summary}\n"
             f"Retrieved evidence:\n{evidence}\n"
             "Return only a compact JSON object with keys: "
@@ -341,12 +395,18 @@ class RAGCoTPipeline:
         stripped = text.strip()
         return stripped == "" or stripped.upper() == "NA"
 
-    def _build_query(self, numeric_summary: str, base_text: str) -> str:
+    def _build_query(self, numeric_summary: str, base_text: str, scale_hint: Optional[str] = None) -> str:
+        scale_text = self._format_scale_hint(scale_hint)
+        if self.scale_aware_rag and scale_text:
+            return f"{self.domain} {scale_text} {numeric_summary} {base_text}"
         return f"{self.domain} {numeric_summary} {base_text}"
 
-    def _build_stage2_query(self, base_query: str, trend_hypothesis: str) -> str:
+    def _build_stage2_query(self, base_query: str, trend_hypothesis: str, scale_hint: Optional[str] = None) -> str:
+        scale_text = self._format_scale_hint(scale_hint)
+        scale_block = f"[TIME SCALE]\n{scale_text}\n" if (self.scale_aware_rag and scale_text) else ""
         return (
             f"{base_query}\n"
+            f"{scale_block}"
             "[TREND HYPOTHESIS]\n"
             f"{trend_hypothesis}\n"
             "Retrieve evidence that best supports/explains this trend hypothesis and is useful for forecasting."
@@ -393,8 +453,11 @@ class RAGCoTPipeline:
             return cleaned
         return cleaned[: max_chars - 3].rstrip() + "..."
 
-    def _compose_text(self, base_text: str, retrieved: List[str], cot_text: str) -> str:
+    def _compose_text(self, base_text: str, retrieved: List[str], cot_text: str, scale_hint: Optional[str] = None) -> str:
         blocks = []
+        scale_text = self._format_scale_hint(scale_hint)
+        if scale_text:
+            blocks.append("Time-scale focus: " + scale_text)
         if base_text and base_text != "NA":
             blocks.append(base_text)
         if retrieved:
@@ -409,9 +472,14 @@ class RAGCoTPipeline:
         numeric_summary: str,
         trend_hypothesis: str,
         retrieved: List[str],
+        scale_hint: Optional[str] = None,
     ) -> str:
         raw_text = base_text if not self._is_empty_text(base_text) else "NA"
+        scale_text = self._format_scale_hint(scale_hint) or "NA"
         lines = [
+            "[TIME SCALE]",
+            scale_text,
+            "",
             "[RAW TEXT]",
             raw_text,
             "",
@@ -434,13 +502,14 @@ class RAGCoTPipeline:
         self,
         numeric_history: Sequence[float],
         base_text: str,
+        scale_hint: Optional[str] = None,
     ) -> Dict[str, str]:
         numeric_summary = self._summarize_numeric(numeric_history)
-        query = self._build_query(numeric_summary, base_text)
+        query = self._build_query(numeric_summary, base_text, scale_hint=scale_hint)
         retrieved = self._retrieve(query)
-        prompt = self._format_prompt(numeric_summary, retrieved)
+        prompt = self._format_prompt(numeric_summary, retrieved, scale_hint=scale_hint)
         cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
-        composed_text = self._compose_text(base_text, retrieved, cot_text)
+        composed_text = self._compose_text(base_text, retrieved, cot_text, scale_hint=scale_hint)
         return {
             "cot_text": cot_text,
             "retrieved_text": " ".join(retrieved),
@@ -453,13 +522,15 @@ class RAGCoTPipeline:
         start_date,
         end_date,
         base_text: str,
+        scale_hint: Optional[str] = None,
     ) -> Dict[str, str]:
-        cache_key = f"{start_date}-{end_date}"
+        scale_key = self._normalize_scale_hint(scale_hint)
+        cache_key = f"{start_date}-{end_date}-{scale_key}"
         if cache_key in self.cache:
             return self.cache[cache_key]
 
         if not self.use_two_stage_rag:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, scale_hint=scale_hint)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
@@ -467,10 +538,10 @@ class RAGCoTPipeline:
 
         numeric_summary = self._summarize_numeric(numeric_history)
         numeric_stats = self._compute_numeric_stats(numeric_history)
-        query = self._build_query(numeric_summary, base_text)
+        query = self._build_query(numeric_summary, base_text, scale_hint=scale_hint)
 
         if self.two_stage_gate and self._is_empty_text(base_text) and abs(numeric_stats["slope"]) < self.trend_slope_eps:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, scale_hint=scale_hint)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
@@ -478,13 +549,13 @@ class RAGCoTPipeline:
 
         retrieved_stage1 = self._retrieve(query, top_k=self.rag_stage1_topk)
         if not retrieved_stage1:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, scale_hint=scale_hint)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
             return packaged
 
-        trend_prompt = self._format_trend_prompt(numeric_summary, retrieved_stage1)
+        trend_prompt = self._format_trend_prompt(numeric_summary, retrieved_stage1, scale_hint=scale_hint)
         trend_hypothesis = self._generate_trend_hypothesis(
             trend_prompt,
             numeric_summary,
@@ -493,7 +564,7 @@ class RAGCoTPipeline:
         )
         trend_hypothesis = self._augment_trend_hypothesis(trend_hypothesis, numeric_stats)
         trend_query_text = self._trend_hypothesis_to_query_text(trend_hypothesis)
-        stage2_query = self._build_stage2_query(query, trend_query_text)
+        stage2_query = self._build_stage2_query(query, trend_query_text, scale_hint=scale_hint)
         retrieved_stage2 = self._retrieve(stage2_query, top_k=self.rag_stage2_topk)
         if retrieved_stage2:
             final_retrieved = self._merge_retrieved(
@@ -508,6 +579,7 @@ class RAGCoTPipeline:
             numeric_summary,
             trend_hypothesis,
             final_retrieved,
+            scale_hint=scale_hint,
         )
 
         packaged = {

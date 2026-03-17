@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1380" viewBox="0 0 1600 1380" role="img" aria-labelledby="title desc">
+  <title id="title">Economy V2 科研逻辑闭环图</title>
+  <desc id="desc">展示时间尺度自适应如何贯穿数据构造、RAG CoT、训练损失、router 引导和实验验证的闭环。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f4ea; }
+      .title { font: 700 30px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1e2a2f; }
+      .subtitle { font: 400 15px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #526066; }
+      .box-title { font: 700 16px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #172126; }
+      .box-text { font: 400 13px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #223138; }
+      .small { font: 400 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #415057; }
+      .box-a { fill: #efe3b5; stroke: #8d6d1f; }
+      .box-b { fill: #dcefe2; stroke: #356b4f; }
+      .box-c { fill: #dbeaf2; stroke: #3b6f85; }
+      .box-d { fill: #f2ddd7; stroke: #8a5148; }
+      .box-e { fill: #e6e0f3; stroke: #65508a; }
+      .box-f { fill: #fffaf0; stroke: #8a7a4f; }
+      .loop { fill: #f3efe4; stroke: #7f7660; stroke-dasharray: 8 6; }
+      .arrow { stroke: #33464f; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .arrow-soft { stroke: #6a757a; stroke-width: 2; fill: none; marker-end: url(#arrowSoft); }
+      .border { stroke-width: 2.2; rx: 18; ry: 18; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#33464f"/>
+    </marker>
+    <marker id="arrowSoft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#6a757a"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1380"/>
+
+  <text class="title" x="800" y="52" text-anchor="middle">Economy V2 科研逻辑闭环图</text>
+  <text class="subtitle" x="800" y="82" text-anchor="middle">时间尺度自适应贯穿数据构造、文本增强、训练优化、推理引导与实验验证</text>
+  <text class="small" x="800" y="108" text-anchor="middle">注：图中涉及的实验数据对比与指标解读，当前仅基于 Economy 任务，不代表所有数据集均已完成同口径验证</text>
+
+  <rect class="box-a border" x="520" y="120" width="560" height="88" rx="18" ry="18"/>
+  <text class="box-title" x="800" y="150" text-anchor="middle">1. 研究问题 / 核心假设</text>
+  <text class="box-text" x="800" y="177" text-anchor="middle">不同样本的时间尺度不同，固定文本窗、固定 horizon 权重、固定 CFG 并不合理</text>
+
+  <rect class="box-f border" x="520" y="248" width="560" height="76" rx="18" ry="18"/>
+  <text class="box-title" x="800" y="278" text-anchor="middle">2. 输入样本</text>
+  <text class="box-text" x="800" y="304" text-anchor="middle">历史数值序列 x(1:L) + 历史报告文本 + 检索语料库</text>
+
+  <rect class="box-b border" x="500" y="364" width="600" height="96" rx="18" ry="18"/>
+  <text class="box-title" x="800" y="394" text-anchor="middle">3. 数据侧尺度判断</text>
+  <text class="box-text" x="800" y="421" text-anchor="middle">从历史数值提取 slope / std / accel / diff 等统计特征</text>
+  <text class="box-text" x="800" y="444" text-anchor="middle">得到样本级 scale_label: short / mid / long</text>
+
+  <rect class="box-c border" x="120" y="520" width="300" height="92" rx="18" ry="18"/>
+  <text class="box-title" x="270" y="550" text-anchor="middle">4A. 动态文本窗选择</text>
+  <text class="box-text" x="270" y="577" text-anchor="middle">按尺度选择文本窗口</text>
+  <text class="box-text" x="270" y="600" text-anchor="middle">6 / 18 / 36</text>
+
+  <rect class="box-c border" x="460" y="520" width="300" height="92" rx="18" ry="18"/>
+  <text class="box-title" x="610" y="550" text-anchor="middle">4B. Scale-aware RAG Query</text>
+  <text class="box-text" x="610" y="577" text-anchor="middle">把 short / mid / long</text>
+  <text class="box-text" x="610" y="600" text-anchor="middle">注入检索 query 与 prompt</text>
+
+  <rect class="box-c border" x="800" y="520" width="300" height="92" rx="18" ry="18"/>
+  <text class="box-title" x="950" y="550" text-anchor="middle">4C. Scale Code</text>
+  <text class="box-text" x="950" y="577" text-anchor="middle">数据侧粗粒度尺度标签</text>
+  <text class="box-text" x="950" y="600" text-anchor="middle">作为 router 弱监督锚点</text>
+
+  <rect class="box-d border" x="1140" y="520" width="340" height="108" rx="18" ry="18"/>
+  <text class="box-title" x="1310" y="550" text-anchor="middle">4D. 两阶段 RAG + CoT</text>
+  <text class="box-text" x="1310" y="577" text-anchor="middle">Stage-1 检索 E0</text>
+  <text class="box-text" x="1310" y="600" text-anchor="middle">生成 trend hypothesis</text>
+  <text class="box-text" x="1310" y="623" text-anchor="middle">Stage-2 检索 E1 并精炼证据</text>
+
+  <rect class="box-d border" x="1140" y="684" width="340" height="88" rx="18" ry="18"/>
+  <text class="box-title" x="1310" y="714" text-anchor="middle">5. 文本条件与趋势先验</text>
+  <text class="box-text" x="1310" y="741" text-anchor="middle">输出 composed_text 与 trend_prior</text>
+  <text class="box-text" x="1310" y="764" text-anchor="middle">direction / strength / volatility</text>
+
+  <rect class="box-e border" x="460" y="684" width="560" height="108" rx="18" ry="18"/>
+  <text class="box-title" x="740" y="714" text-anchor="middle">6. 扩散预测模型 CSDI_Forecasting</text>
+  <text class="box-text" x="740" y="741" text-anchor="middle">条件 = 数值历史 + 时间特征 + 文本编码 + trend prior</text>
+  <text class="box-text" x="740" y="764" text-anchor="middle">主体任务仍是条件扩散式时间序列预测</text>
+
+  <rect class="box-b border" x="120" y="856" width="320" height="110" rx="18" ry="18"/>
+  <text class="box-title" x="280" y="886" text-anchor="middle">7A. 主预测损失</text>
+  <text class="box-text" x="280" y="913" text-anchor="middle">整体预测区间误差</text>
+  <text class="box-text" x="280" y="936" text-anchor="middle">保证模型完成基本 forecasting 任务</text>
+
+  <rect class="box-b border" x="480" y="856" width="320" height="110" rx="18" ry="18"/>
+  <text class="box-title" x="640" y="886" text-anchor="middle">7B. 多尺度 horizon 切分</text>
+  <text class="box-text" x="640" y="913" text-anchor="middle">1 / 2-3 / 4-6 / 7-12</text>
+  <text class="box-text" x="640" y="936" text-anchor="middle">把未来预测区间拆成短中长期子任务</text>
+
+  <rect class="box-b border" x="840" y="840" width="420" height="142" rx="18" ry="18"/>
+  <text class="box-title" x="1050" y="870" text-anchor="middle">7C. Scale Router</text>
+  <text class="box-text" x="1050" y="897" text-anchor="middle">输入历史统计特征 + trend_prior + text_mask</text>
+  <text class="box-text" x="1050" y="920" text-anchor="middle">输出各个 horizon band 的样本级权重</text>
+  <text class="box-text" x="1050" y="943" text-anchor="middle">决定训练时更重哪段预测步</text>
+  <text class="box-text" x="1050" y="966" text-anchor="middle">并保留 teacher regularization 稳定训练</text>
+
+  <rect class="box-a border" x="400" y="1046" width="420" height="104" rx="18" ry="18"/>
+  <text class="box-title" x="610" y="1076" text-anchor="middle">8. 训练目标</text>
+  <text class="box-text" x="610" y="1103" text-anchor="middle">L = 主损失 + lambda × 多尺度辅助损失</text>
+  <text class="box-text" x="610" y="1126" text-anchor="middle">让同一个样本按其时间尺度偏好被优化</text>
+
+  <rect class="box-a border" x="900" y="1046" width="420" height="104" rx="18" ry="18"/>
+  <text class="box-title" x="1110" y="1076" text-anchor="middle">9. 推理阶段 Router-aware Guidance</text>
+  <text class="box-text" x="1110" y="1103" text-anchor="middle">router -> scale_score -> sample-wise guide_w</text>
+  <text class="box-text" x="1110" y="1126" text-anchor="middle">把训练得到的尺度偏好延续到采样阶段</text>
+
+  <rect class="loop border" x="360" y="1194" width="880" height="86" rx="22" ry="22"/>
+  <text class="box-title" x="800" y="1226" text-anchor="middle">10. 实验验证与闭环回收</text>
+  <text class="box-text" x="800" y="1253" text-anchor="middle">输出整体 MSE / MAE、逐 horizon 指标、逐 band 指标、router 统计</text>
+  <text class="box-text" x="800" y="1274" text-anchor="middle">检验“时间尺度自适应”是否同时改善文本组织、训练关注重点和推理引导强度</text>
+
+  <path class="arrow" d="M800 208 L800 248"/>
+  <path class="arrow" d="M800 324 L800 364"/>
+  <path class="arrow" d="M650 460 L270 520"/>
+  <path class="arrow" d="M760 460 L610 520"/>
+  <path class="arrow" d="M840 460 L950 520"/>
+  <path class="arrow" d="M950 460 L1310 520"/>
+  <path class="arrow" d="M420 566 L1140 566"/>
+  <path class="arrow" d="M760 566 L1140 566"/>
+  <path class="arrow" d="M1310 628 L1310 684"/>
+  <path class="arrow" d="M1140 728 L1020 728"/>
+  <path class="arrow" d="M1310 772 L1260 840"/>
+  <path class="arrow" d="M950 612 L950 840"/>
+  <path class="arrow" d="M740 792 L280 856"/>
+  <path class="arrow" d="M740 792 L640 856"/>
+  <path class="arrow" d="M740 792 L980 840"/>
+  <path class="arrow" d="M280 966 L520 1046"/>
+  <path class="arrow" d="M640 966 L610 1046"/>
+  <path class="arrow" d="M1050 982 L700 1046"/>
+  <path class="arrow" d="M1080 982 L1110 1046"/>
+  <path class="arrow" d="M610 1150 L720 1194"/>
+  <path class="arrow" d="M1110 1150 L960 1194"/>
+  <path class="arrow-soft" d="M360 1236 C220 1236, 180 180, 500 164"/>
+
+  <text class="small" x="1320" y="1188">闭环关键：同一个“时间尺度判断”被重复用于</text>
+  <text class="small" x="1320" y="1208">文本构造、训练优化、推理引导，而不是只用于单一模块。</text>
+  <text class="small" x="800" y="1336" text-anchor="middle">当前实验对比主线：Economy V2。其他数据集在仓库中主要体现为可复用配置与能力接口。</text>
+</svg>

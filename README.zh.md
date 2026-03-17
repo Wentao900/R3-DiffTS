@@ -9,6 +9,8 @@ pip install -r requirements.txt
 ## 数据集
 公共基准：Time-MMD（可参考原项目仓库）。
 
+> 说明：仓库中虽然保留了多个数据集的配置与可运行路径，但当前写入仓库的“实验数据对比 / 指标分析 / 结论性描述”仅基于 `Economy`。其他数据集目前应视为能力预留或运行示例，不应直接理解为已完成同口径实验验证。
+
 ## 训练 / 评测
 ```bash
 bash ./run.sh
@@ -171,6 +173,7 @@ train:
 - 如需固定某个值，直接传 `--guide_w`。
 
 ## 当前 Economy V2 基线
+- 口径边界：当前仓库里的对比表、`guide_w` 选参结果和指标解读仅针对 `Economy`。
 - 当前使用配置：`config/economy_36_12_scale_router_guide.yaml`
 - 任务设置：`seq_len=36`、`pred_len=12`、`text_len=36`、`freq=m`
 - 当前报告只记录验证集上的 `guide_w` 选参结果，不写测试集指标。
@@ -210,7 +213,9 @@ python -u exe_forecasting.py \
 ## 调试
 使用 `debug_two_stage_rag.py` 查看 Q1/E0/z0/Q2/E1 及文本拼接预览。
 
-## 完整命令示例
+## 额外运行示例
+这一节只是能力演示，不属于当前仓库已汇报的 `Economy` 实验对比结果。
+
 ```bash
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \

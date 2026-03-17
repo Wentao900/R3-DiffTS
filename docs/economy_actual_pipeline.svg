@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180" role="img" aria-labelledby="title desc">
+  <title id="title">Economy 实际实验流程图</title>
+  <desc id="desc">展示 Economy 版本从历史序列、时间尺度识别、两阶段 RAG、趋势先验、条件扩散训练，到 scale router 自适应 guidance 推理的完整流程。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f1e7; }
+      .title { font: 700 32px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1c262b; }
+      .subtitle { font: 400 16px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #4a5a61; }
+      .lane-title { font: 700 18px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #1d2a2f; }
+      .box-title { font: 700 16px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #162025; }
+      .box-text { font: 400 13px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #24343b; }
+      .small { font: 400 12px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #516066; }
+      .panel { fill: #fbf8f2; stroke: #b8ab8c; stroke-width: 2; rx: 26; ry: 26; }
+      .panel-train { fill: #f7fbf6; stroke: #8daa90; stroke-width: 2; rx: 24; ry: 24; }
+      .panel-infer { fill: #f8f6fb; stroke: #9c92b8; stroke-width: 2; rx: 24; ry: 24; }
+      .box-a { fill: #ece1b4; stroke: #8d6d1f; stroke-width: 2; rx: 18; ry: 18; }
+      .box-b { fill: #dcefe3; stroke: #3f6f58; stroke-width: 2; rx: 18; ry: 18; }
+      .box-c { fill: #d9eaf5; stroke: #406f85; stroke-width: 2; rx: 18; ry: 18; }
+      .box-d { fill: #f4ddd7; stroke: #895048; stroke-width: 2; rx: 18; ry: 18; }
+      .box-e { fill: #e7e0f5; stroke: #68518c; stroke-width: 2; rx: 18; ry: 18; }
+      .note { fill: #fff8e7; stroke: #a3863e; stroke-width: 2; rx: 18; ry: 18; }
+      .arrow { stroke: #334750; stroke-width: 2.6; fill: none; marker-end: url(#arrow); }
+      .arrow-soft { stroke: #6c7478; stroke-width: 2.1; fill: none; marker-end: url(#arrowSoft); stroke-dasharray: 7 6; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#334750"/>
+    </marker>
+    <marker id="arrowSoft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#6c7478"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1180"/>
+
+  <text class="title" x="900" y="52" text-anchor="middle">Economy 实际实验流程图</text>
+  <text class="subtitle" x="900" y="81" text-anchor="middle">主配置对应的是“时间尺度识别 + 两阶段 RAG + scale router 自适应 guidance”，而不是 CoT 直接控制 CFG</text>
+
+  <rect class="panel" x="110" y="110" width="1580" height="168" rx="26" ry="26"/>
+  <text class="lane-title" x="180" y="145">共享前处理</text>
+
+  <rect class="box-a" x="150" y="168" width="270" height="74" rx="18" ry="18"/>
+  <text class="box-title" x="285" y="197" text-anchor="middle">1. 历史数值序列</text>
+  <text class="box-text" x="285" y="221" text-anchor="middle">lookback = 36，作为样本主输入</text>
+
+  <rect class="box-b" x="480" y="154" width="320" height="102" rx="18" ry="18"/>
+  <text class="box-title" x="640" y="183" text-anchor="middle">2. 时间尺度识别</text>
+  <text class="box-text" x="640" y="207" text-anchor="middle">从 slope / std / accel / total shift</text>
+  <text class="box-text" x="640" y="228" text-anchor="middle">推断 short / mid / long</text>
+  <text class="box-text" x="640" y="249" text-anchor="middle">同时得到动态 text_window_len</text>
+
+  <rect class="box-c" x="860" y="154" width="320" height="102" rx="18" ry="18"/>
+  <text class="box-title" x="1020" y="183" text-anchor="middle">3. 动态文本窗口</text>
+  <text class="box-text" x="1020" y="207" text-anchor="middle">按尺度选择文本窗</text>
+  <text class="box-text" x="1020" y="228" text-anchor="middle">short / mid / long 对应 6 / 18 / 36</text>
+  <text class="box-text" x="1020" y="249" text-anchor="middle">只截取更匹配当前样本的历史文本</text>
+
+  <rect class="box-d" x="1240" y="146" width="390" height="118" rx="18" ry="18"/>
+  <text class="box-title" x="1435" y="175" text-anchor="middle">4. 两阶段 RAG + 趋势假设</text>
+  <text class="box-text" x="1435" y="199" text-anchor="middle">Stage-1 检索初始证据 E0</text>
+  <text class="box-text" x="1435" y="220" text-anchor="middle">生成结构化 trend hypothesis / CoT</text>
+  <text class="box-text" x="1435" y="241" text-anchor="middle">Stage-2 用趋势假设精炼检索 E1</text>
+
+  <path class="arrow" d="M420 205 L480 205"/>
+  <path class="arrow" d="M800 205 L860 205"/>
+  <path class="arrow" d="M1180 205 L1240 205"/>
+
+  <rect class="panel-train" x="110" y="330" width="760" height="690" rx="24" ry="24"/>
+  <text class="lane-title" x="180" y="365">训练阶段</text>
+
+  <rect class="box-d" x="160" y="396" width="300" height="110" rx="18" ry="18"/>
+  <text class="box-title" x="310" y="425" text-anchor="middle">5A. 生成训练条件</text>
+  <text class="box-text" x="310" y="449" text-anchor="middle">组合原始文本、精炼证据、趋势假设</text>
+  <text class="box-text" x="310" y="470" text-anchor="middle">得到 composed_text</text>
+  <text class="box-text" x="310" y="491" text-anchor="middle">并解析出 trend_prior</text>
+
+  <rect class="box-c" x="520" y="396" width="300" height="110" rx="18" ry="18"/>
+  <text class="box-title" x="670" y="425" text-anchor="middle">5B. 文本编码</text>
+  <text class="box-text" x="670" y="449" text-anchor="middle">composed_text -> 文本编码器</text>
+  <text class="box-text" x="670" y="470" text-anchor="middle">生成 context</text>
+  <text class="box-text" x="670" y="491" text-anchor="middle">作为扩散模型的文本条件</text>
+
+  <rect class="box-e" x="160" y="566" width="300" height="118" rx="18" ry="18"/>
+  <text class="box-title" x="310" y="595" text-anchor="middle">6A. 条件扩散主任务</text>
+  <text class="box-text" x="310" y="619" text-anchor="middle">数值历史 + 时间特征 + 文本 context</text>
+  <text class="box-text" x="310" y="640" text-anchor="middle">进入 CSDI_Forecasting</text>
+  <text class="box-text" x="310" y="661" text-anchor="middle">学习未来 12 步的条件生成</text>
+
+  <rect class="box-b" x="520" y="566" width="300" height="118" rx="18" ry="18"/>
+  <text class="box-title" x="670" y="595" text-anchor="middle">6B. 多尺度 horizon 切分</text>
+  <text class="box-text" x="670" y="619" text-anchor="middle">把 pred_len = 12 拆成多个 band</text>
+  <text class="box-text" x="670" y="640" text-anchor="middle">例如 1 / 2-3 / 4-6 / 7-12</text>
+  <text class="box-text" x="670" y="661" text-anchor="middle">分别计算 band loss</text>
+
+  <rect class="box-b" x="160" y="744" width="300" height="132" rx="18" ry="18"/>
+  <text class="box-title" x="310" y="773" text-anchor="middle">7A. Scale Router 输入</text>
+  <text class="box-text" x="310" y="797" text-anchor="middle">历史统计特征</text>
+  <text class="box-text" x="310" y="818" text-anchor="middle">+ trend_prior</text>
+  <text class="box-text" x="310" y="839" text-anchor="middle">+ text_mask</text>
+  <text class="box-text" x="310" y="860" text-anchor="middle">推断样本更偏短期还是长期</text>
+
+  <rect class="box-b" x="520" y="744" width="300" height="132" rx="18" ry="18"/>
+  <text class="box-title" x="670" y="773" text-anchor="middle">7B. Router 输出 band 权重</text>
+  <text class="box-text" x="670" y="797" text-anchor="middle">给不同 horizon band 分配样本级权重</text>
+  <text class="box-text" x="670" y="818" text-anchor="middle">配合 teacher regularization</text>
+  <text class="box-text" x="670" y="839" text-anchor="middle">稳定训练初期的尺度判断</text>
+  <text class="box-text" x="670" y="860" text-anchor="middle">不是直接输出最终预测</text>
+
+  <rect class="box-a" x="250" y="936" width="470" height="58" rx="18" ry="18"/>
+  <text class="box-title" x="485" y="972" text-anchor="middle">8. 总训练目标 = 主扩散损失 + λ × 多尺度辅助损失</text>
+
+  <path class="arrow" d="M1435 264 L1435 310 C1435 340 310 340 310 396"/>
+  <path class="arrow" d="M310 506 L310 566"/>
+  <path class="arrow" d="M460 451 L520 451"/>
+  <path class="arrow" d="M670 506 L670 566"/>
+  <path class="arrow" d="M310 684 L310 744"/>
+  <path class="arrow" d="M670 684 L670 744"/>
+  <path class="arrow" d="M460 810 L520 810"/>
+  <path class="arrow" d="M310 876 L400 936"/>
+  <path class="arrow" d="M670 876 L570 936"/>
+  <path class="arrow-soft" d="M1435 264 C1435 300 670 300 670 396"/>
+
+  <rect class="panel-infer" x="930" y="330" width="760" height="690" rx="24" ry="24"/>
+  <text class="lane-title" x="1000" y="365">推理阶段</text>
+
+  <rect class="box-e" x="980" y="396" width="300" height="118" rx="18" ry="18"/>
+  <text class="box-title" x="1130" y="425" text-anchor="middle">5C. 复用同样的文本构造</text>
+  <text class="box-text" x="1130" y="449" text-anchor="middle">同样先做时间尺度识别</text>
+  <text class="box-text" x="1130" y="470" text-anchor="middle">再构造 composed_text 与 trend_prior</text>
+  <text class="box-text" x="1130" y="491" text-anchor="middle">保持训练/推理语义一致</text>
+
+  <rect class="box-a" x="1340" y="396" width="300" height="118" rx="18" ry="18"/>
+  <text class="box-title" x="1490" y="425" text-anchor="middle">5D. 先选全局 guide_w</text>
+  <text class="box-text" x="1490" y="449" text-anchor="middle">在验证集扫描 guide_w 候选集</text>
+  <text class="box-text" x="1490" y="470" text-anchor="middle">选出当前模型的全局最优值</text>
+  <text class="box-text" x="1490" y="491" text-anchor="middle">这是推理的第一层 guidance</text>
+
+  <rect class="box-b" x="980" y="574" width="300" height="140" rx="18" ry="18"/>
+  <text class="box-title" x="1130" y="603" text-anchor="middle">6C. Router 计算样本级 guide ratio</text>
+  <text class="box-text" x="1130" y="627" text-anchor="middle">输入仍然是历史统计特征</text>
+  <text class="box-text" x="1130" y="648" text-anchor="middle">+ trend_prior + text_mask</text>
+  <text class="box-text" x="1130" y="669" text-anchor="middle">输出 scale_score 与 guide_ratio</text>
+  <text class="box-text" x="1130" y="690" text-anchor="middle">把全局 guide_w 缩放成 sample_guide</text>
+
+  <rect class="box-c" x="1340" y="574" width="300" height="140" rx="18" ry="18"/>
+  <text class="box-title" x="1490" y="603" text-anchor="middle">6D. 条件扩散采样</text>
+  <text class="box-text" x="1490" y="627" text-anchor="middle">pred = uncond + sample_guide × (cond - uncond)</text>
+  <text class="box-text" x="1490" y="648" text-anchor="middle">也就是样本级 CFG 强度</text>
+  <text class="box-text" x="1490" y="669" text-anchor="middle">由 router 调整，而不是 CoT 直接给定</text>
+  <text class="box-text" x="1490" y="690" text-anchor="middle">这是 Economy 版的核心区别</text>
+
+  <rect class="box-a" x="1140" y="782" width="340" height="70" rx="18" ry="18"/>
+  <text class="box-title" x="1310" y="823" text-anchor="middle">7. 输出最终预测 samples / median forecast</text>
+
+  <rect class="note" x="1010" y="904" width="600" height="82" rx="18" ry="18"/>
+  <text class="box-title" x="1310" y="934" text-anchor="middle">关键解释</text>
+  <text class="box-text" x="1310" y="958" text-anchor="middle">Economy 主实验没有把 CoT 直接变成 trend-aware CFG 时间调度</text>
+  <text class="box-text" x="1310" y="979" text-anchor="middle">它是“CoT / 趋势假设 -> trend_prior -> router 辅助 -> router 自适应 guidance”</text>
+
+  <path class="arrow" d="M1435 264 L1435 310 C1435 340 1130 340 1130 396"/>
+  <path class="arrow" d="M1490 514 L1490 574"/>
+  <path class="arrow" d="M1280 455 L1340 455"/>
+  <path class="arrow" d="M1130 514 L1130 574"/>
+  <path class="arrow" d="M1280 644 L1340 644"/>
+  <path class="arrow" d="M1490 714 L1490 760 C1490 782 1370 782 1370 782"/>
+  <path class="arrow" d="M1130 714 L1130 760 C1130 782 1250 782 1250 782"/>
+
+  <rect class="note" x="260" y="1050" width="1280" height="76" rx="18" ry="18"/>
+  <text class="box-title" x="900" y="1080" text-anchor="middle">一句话总结</text>
+  <text class="box-text" x="900" y="1104" text-anchor="middle">Economy = 历史序列 -> 时间尺度识别 -> 两阶段 RAG / 趋势假设 -> 条件扩散训练 -> scale router 多尺度加权 -> router 自适应 guidance 推理 -> 最终预测</text>
+
+  <text class="small" x="900" y="1150" text-anchor="middle">推荐在论文或汇报中表述为：CoT/趋势假设先服务于文本条件与 trend prior，再由 scale router 统一驱动训练侧与推理侧的尺度自适应。</text>
+</svg>
