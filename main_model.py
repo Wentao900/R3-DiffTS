@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -116,6 +117,11 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.use_text_score_gate = bool(config["model"].get("use_text_score_gate", False))
+        self.text_score_gate_strength = float(config["model"].get("text_score_gate_strength", 1.0))
+        self.text_score_gate_floor = float(config["model"].get("text_score_gate_floor", 0.0))
+        self.text_score_model_path = config["model"].get("text_score_model_path")
+        self.text_score_model = self._load_text_score_model(self.text_score_model_path)
         train_cfg = config.get("train", {})
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
@@ -467,6 +473,112 @@ class CSDI_base(nn.Module):
             )
             loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
+
+    def _load_text_score_model(self, model_path):
+        if (not self.use_text_score_gate) or (not model_path):
+            return None
+        try:
+            with open(model_path, "r") as f:
+                payload = json.load(f)
+        except Exception:
+            return None
+        metrics = payload.get("metrics", payload)
+        feature_columns = payload.get("feature_columns", [])
+        weights = metrics.get("weights", {})
+        feature_mean = metrics.get("feature_mean", {})
+        feature_std = metrics.get("feature_std", {})
+        target_mean = float(metrics.get("mean_target", 0.0))
+        target_std = float(metrics.get("std_target", 1.0))
+        if target_std <= 1e-8:
+            target_std = 1.0
+        if not feature_columns or "intercept" not in weights:
+            return None
+        return {
+            "feature_columns": list(feature_columns),
+            "weights": dict(weights),
+            "feature_mean": dict(feature_mean),
+            "feature_std": dict(feature_std),
+            "target_mean": target_mean,
+            "target_std": target_std,
+        }
+
+    def _compute_online_text_score(self, batch, text_mask, trend_prior, text_window_len, guide_w=None):
+        base_score = text_mask.float()
+        if not self.use_text_score_gate:
+            return base_score
+        explicit_score = batch.get("text_score")
+        if explicit_score is not None:
+            if torch.is_tensor(explicit_score):
+                score = explicit_score.to(self.device).float().reshape(-1)
+            else:
+                score = torch.tensor(explicit_score, device=self.device, dtype=torch.float32).reshape(-1)
+            return torch.clamp(score, 0.0, 1.0) * base_score
+        if self.text_score_model is None:
+            return base_score
+
+        batch_size = int(text_mask.shape[0])
+        raw_texts = batch.get("raw_text", batch.get("texts", ["NA"] * batch_size))
+        full_texts = batch.get("texts", ["NA"] * batch_size)
+        retrieved_texts = batch.get("retrieved_text", [""] * batch_size)
+        cot_texts = batch.get("cot_text", [""] * batch_size)
+        if isinstance(raw_texts, tuple):
+            raw_texts = list(raw_texts)
+        if isinstance(full_texts, tuple):
+            full_texts = list(full_texts)
+        if isinstance(retrieved_texts, tuple):
+            retrieved_texts = list(retrieved_texts)
+        if isinstance(cot_texts, tuple):
+            cot_texts = list(cot_texts)
+        if not isinstance(raw_texts, list):
+            raw_texts = [raw_texts] * batch_size
+        if not isinstance(full_texts, list):
+            full_texts = [full_texts] * batch_size
+        if not isinstance(retrieved_texts, list):
+            retrieved_texts = [retrieved_texts] * batch_size
+        if not isinstance(cot_texts, list):
+            cot_texts = [cot_texts] * batch_size
+
+        guide_value = 0.0 if guide_w is None else float(guide_w)
+        feature_tensors = {
+            "text_mark": text_mask.float().reshape(-1),
+            "text_window_len": text_window_len.float().reshape(-1),
+            "scale_code": batch.get("scale_code").to(self.device).float().reshape(-1) if torch.is_tensor(batch.get("scale_code")) else torch.zeros(batch_size, device=self.device),
+            "raw_text_len": torch.tensor([len(str(item).split()) for item in raw_texts], device=self.device, dtype=torch.float32),
+            "full_text_len": torch.tensor([len(str(item).split()) for item in full_texts], device=self.device, dtype=torch.float32),
+            "retrieved_text_len": torch.tensor([len(str(item).split()) for item in retrieved_texts], device=self.device, dtype=torch.float32),
+            "cot_text_len": torch.tensor([len(str(item).split()) for item in cot_texts], device=self.device, dtype=torch.float32),
+            "trend_direction": trend_prior[:, 0].float(),
+            "trend_strength": trend_prior[:, 1].float(),
+            "trend_volatility": trend_prior[:, 2].float(),
+            "guide_w": torch.full((batch_size,), guide_value, device=self.device, dtype=torch.float32),
+        }
+
+        linear = torch.full((batch_size,), float(self.text_score_model["weights"].get("intercept", 0.0)), device=self.device, dtype=torch.float32)
+        for feature_name in self.text_score_model["feature_columns"]:
+            value = feature_tensors.get(feature_name)
+            if value is None:
+                continue
+            mean = float(self.text_score_model["feature_mean"].get(feature_name, 0.0))
+            std = float(self.text_score_model["feature_std"].get(feature_name, 1.0))
+            if abs(std) < 1e-8:
+                std = 1.0
+            weight = float(self.text_score_model["weights"].get(feature_name, 0.0))
+            linear = linear + weight * ((value - mean) / std)
+        target_mean = float(self.text_score_model["target_mean"])
+        target_std = float(self.text_score_model["target_std"])
+        score = torch.sigmoid((linear - target_mean) / max(target_std, 1e-6))
+        return score * base_score
+
+    def _apply_text_score_gate(self, text_score):
+        if text_score is None:
+            return None
+        base = text_score.float()
+        if not self.use_text_score_gate:
+            return base
+        floor = min(max(self.text_score_gate_floor, 0.0), 1.0)
+        strength = min(max(self.text_score_gate_strength, 0.0), 1.0)
+        gated = floor + (1.0 - floor) * base
+        return ((1.0 - strength) + strength * gated) * (base > 0).float()
 
     def _resolve_multi_res_boundaries(self, raw_boundaries, pred_len):
         if raw_boundaries is None:
@@ -1095,12 +1207,12 @@ class CSDI_Forecasting(CSDI_base):
         self.num_sample_features = config["model"]["num_sample_features"]
         
 
-    def process_data(self, batch):
+    def process_data(self, batch, guide_w=None):
         observed_data = batch["observed_data"].to(self.device).float()
         observed_mask = batch["observed_mask"].to(self.device).float()
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
-        text_mask = batch["text_mark"].to(self.device).int()
+        text_mask = batch["text_mark"].to(self.device).float()
         scale_code = batch.get("scale_code")
         if scale_code is None:
             scale_code = torch.full((observed_data.shape[0],), 1, device=self.device, dtype=torch.long)
@@ -1122,6 +1234,8 @@ class CSDI_Forecasting(CSDI_base):
         else:
             timesteps = None
         texts = list(batch["texts"]) if self.with_texts else None
+        text_score = self._compute_online_text_score(batch, text_mask, trend_prior, text_window_len, guide_w=guide_w)
+        text_mask = self._apply_text_score_gate(text_score)
 
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
@@ -1256,7 +1370,7 @@ class CSDI_Forecasting(CSDI_base):
         return side_info
 
     def forward(self, batch, is_train=1):
-        data = self.process_data(batch)
+        data = self.process_data(batch, guide_w=None)
         (
             observed_data,
             observed_mask,
@@ -1324,7 +1438,7 @@ class CSDI_Forecasting(CSDI_base):
         )
 
     def evaluate(self, batch, n_samples, guide_w):
-        data = self.process_data(batch)
+        data = self.process_data(batch, guide_w=guide_w)
         (
             observed_data,
             observed_mask,
@@ -1381,7 +1495,7 @@ class CSDI_Forecasting(CSDI_base):
     def get_scale_router_diagnostics(self, batch, guide_w=None):
         if not self.scale_router_enabled:
             return None
-        data = self.process_data(batch)
+        data = self.process_data(batch, guide_w=guide_w)
         (
             observed_data,
             _,

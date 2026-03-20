@@ -1,3 +1,4 @@
+import csv
 import numpy as np
 import torch
 from torch.optim import Adam, AdamW
@@ -117,6 +118,438 @@ def calc_quantile_CRPS_sum(target, forecast, eval_points, mean_scaler, scaler):
         q_loss = quantile_loss(target, q_pred, quantiles[i], eval_points)
         CRPS += q_loss / denom
     return CRPS.item() / len(quantiles)
+
+
+def _clone_counterfactual_batch(batch):
+    cloned = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.clone()
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+        elif isinstance(value, tuple):
+            cloned[key] = list(value)
+        else:
+            cloned[key] = value
+    return cloned
+
+
+def _is_nonempty_text(text):
+    if text is None:
+        return False
+    value = str(text).strip()
+    return len(value) > 0 and value.upper() != "NA"
+
+
+def _build_counterfactual_batch(batch, mode):
+    variant = _clone_counterfactual_batch(batch)
+    batch_size = None
+    if "text_mark" in batch and torch.is_tensor(batch["text_mark"]):
+        batch_size = int(batch["text_mark"].shape[0])
+    elif "texts" in batch and isinstance(batch["texts"], (list, tuple)):
+        batch_size = len(batch["texts"])
+    else:
+        raise ValueError("Unable to infer batch size for counterfactual evaluation.")
+
+    if mode == "full_text":
+        return variant
+
+    if mode == "text_off":
+        variant["texts"] = ["NA"] * batch_size
+        variant["retrieved_text"] = [""] * batch_size
+        variant["cot_text"] = [""] * batch_size
+        if "text_mark" in variant and torch.is_tensor(variant["text_mark"]):
+            variant["text_mark"] = torch.zeros_like(variant["text_mark"])
+        if "trend_prior" in variant and torch.is_tensor(variant["trend_prior"]):
+            variant["trend_prior"] = torch.zeros_like(variant["trend_prior"])
+        if "text_score" in variant and torch.is_tensor(variant["text_score"]):
+            variant["text_score"] = torch.zeros_like(variant["text_score"])
+        return variant
+
+    if mode == "raw_only":
+        raw_texts = variant.get("raw_text", variant.get("texts"))
+        if isinstance(raw_texts, tuple):
+            raw_texts = list(raw_texts)
+        elif not isinstance(raw_texts, list):
+            raw_texts = [raw_texts] * batch_size
+        raw_texts = [str(item) if item is not None else "NA" for item in raw_texts]
+        variant["texts"] = raw_texts
+        variant["retrieved_text"] = [""] * batch_size
+        variant["cot_text"] = [""] * batch_size
+        marks = [1 if _is_nonempty_text(item) else 0 for item in raw_texts]
+        if "text_mark" in variant and torch.is_tensor(variant["text_mark"]):
+            variant["text_mark"] = torch.as_tensor(marks, dtype=variant["text_mark"].dtype, device=variant["text_mark"].device)
+        if "trend_prior" in variant and torch.is_tensor(variant["trend_prior"]):
+            variant["trend_prior"] = torch.zeros_like(variant["trend_prior"])
+        return variant
+
+    raise ValueError(f"Unsupported counterfactual mode: {mode}")
+
+
+def _unpack_eval_output(output, save_attn=False, save_token=False):
+    if save_attn:
+        if save_token:
+            samples, c_target, eval_points, observed_points, observed_time, _, _ = output
+        else:
+            samples, c_target, eval_points, observed_points, observed_time, _ = output
+    else:
+        samples, c_target, eval_points, observed_points, observed_time = output
+    return samples, c_target, eval_points, observed_points, observed_time
+
+
+def _token_set(text):
+    value = str(text).strip().lower()
+    if not value or value == "na":
+        return set()
+    return set(value.split())
+
+
+def _safe_ratio(num, den):
+    return float(num) / float(den) if den else 0.0
+
+
+def _compute_batch_sample_metrics(output, scaler):
+    samples, c_target, eval_points, _, _ = _unpack_eval_output(output, save_attn=False, save_token=False)
+    samples = samples.permute(0, 1, 3, 2)
+    c_target = c_target.permute(0, 2, 1)
+    eval_points = eval_points.permute(0, 2, 1)
+    samples_median = samples.median(dim=1).values
+    sq = (((samples_median - c_target) * eval_points) ** 2) * (scaler ** 2)
+    ab = torch.abs((samples_median - c_target) * eval_points) * scaler
+    denom = eval_points.sum(dim=(1, 2)).detach().cpu().numpy()
+    mse_num = sq.sum(dim=(1, 2)).detach().cpu().numpy()
+    mae_num = ab.sum(dim=(1, 2)).detach().cpu().numpy()
+    safe = np.maximum(denom, 1e-8)
+    return {
+        "mse": mse_num / safe,
+        "mae": mae_num / safe,
+        "eval_count": denom,
+    }
+
+
+def _safe_group_value(value):
+    if value is None:
+        return "NA"
+    if isinstance(value, float):
+        if np.isnan(value):
+            return "NA"
+        if value.is_integer():
+            return str(int(value))
+    return str(value)
+
+
+def _summarize_counterfactual_groups(rows, modes, group_key):
+    grouped = {}
+    for row in rows:
+        group_value = _safe_group_value(row.get(group_key))
+        stats = grouped.setdefault(group_value, {"sample_count": 0, "modes": {}})
+        stats["sample_count"] += 1
+        for mode in modes:
+            mode_stats = stats["modes"].setdefault(
+                mode,
+                {
+                    "mse_sum": 0.0,
+                    "mae_sum": 0.0,
+                    "mse_count": 0,
+                    "mae_count": 0,
+                    "delta_mse_sum": 0.0,
+                    "delta_mse_pos": 0,
+                    "delta_mse_neg": 0,
+                    "delta_mae_sum": 0.0,
+                },
+            )
+            mse_key = f"mse_{mode}"
+            mae_key = f"mae_{mode}"
+            if mse_key in row:
+                mse_value = float(row[mse_key])
+                mode_stats["mse_sum"] += mse_value
+                mode_stats["mse_count"] += 1
+            if mae_key in row:
+                mae_value = float(row[mae_key])
+                mode_stats["mae_sum"] += mae_value
+                mode_stats["mae_count"] += 1
+            if mode == "text_off":
+                continue
+            delta_mse = float(row[f"delta_mse_{mode}"])
+            delta_mae = float(row[f"delta_mae_{mode}"])
+            mode_stats["delta_mse_sum"] += delta_mse
+            mode_stats["delta_mae_sum"] += delta_mae
+            if delta_mse > 0.0:
+                mode_stats["delta_mse_pos"] += 1
+            elif delta_mse < 0.0:
+                mode_stats["delta_mse_neg"] += 1
+
+    summary = {}
+    for group_value, group_stats in grouped.items():
+        summary[group_value] = {"sample_count": int(group_stats["sample_count"]), "modes": {}}
+        for mode, mode_stats in group_stats["modes"].items():
+            mode_summary = {}
+            if mode_stats["mse_count"] > 0:
+                mode_summary["MSE"] = float(mode_stats["mse_sum"] / mode_stats["mse_count"])
+            if mode_stats["mae_count"] > 0:
+                mode_summary["MAE"] = float(mode_stats["mae_sum"] / mode_stats["mae_count"])
+            if mode != "text_off" and group_stats["sample_count"] > 0:
+                count = float(group_stats["sample_count"])
+                mode_summary["delta_vs_text_off"] = {
+                    "mean_delta_mse": float(mode_stats["delta_mse_sum"] / count),
+                    "mean_delta_mae": float(mode_stats["delta_mae_sum"] / count),
+                    "positive_gain_rate": float(mode_stats["delta_mse_pos"] / count),
+                    "negative_gain_rate": float(mode_stats["delta_mse_neg"] / count),
+                }
+            summary[group_value]["modes"][mode] = mode_summary
+    return summary
+
+
+def evaluate_counterfactual(
+    model,
+    test_loader,
+    nsample=100,
+    scaler=1,
+    mean_scaler=0,
+    foldername="",
+    guide_w=0,
+    model_folder=None,
+    split="test",
+    modes=None,
+):
+    del mean_scaler
+    load_folder = model_folder or foldername
+    if load_folder:
+        model_path = os.path.join(load_folder, "model.pth")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=model.device))
+
+    requested_modes = list(modes) if modes else ["text_off", "raw_only", "full_text"]
+    ordered_modes = []
+    for mode in ["text_off", "raw_only", "full_text"]:
+        if mode in requested_modes and mode not in ordered_modes:
+            ordered_modes.append(mode)
+    for mode in requested_modes:
+        if mode not in ordered_modes:
+            ordered_modes.append(mode)
+    if "text_off" not in ordered_modes:
+        ordered_modes.insert(0, "text_off")
+
+    with torch.no_grad():
+        model.eval()
+        summary = {mode: {"mse_sum": 0.0, "mae_sum": 0.0, "eval_sum": 0.0, "sample_count": 0} for mode in ordered_modes}
+        rows = []
+        sample_offset = 0
+        with tqdm(test_loader, mininterval=1.0, maxinterval=50.0) as it:
+            for batch_no, test_batch in enumerate(it, start=1):
+                batch_metrics = {}
+                batch_size = None
+                for mode in ordered_modes:
+                    variant_batch = _build_counterfactual_batch(test_batch, mode)
+                    output = model.evaluate(variant_batch, nsample, guide_w)
+                    metrics = _compute_batch_sample_metrics(output, scaler)
+                    batch_metrics[mode] = metrics
+                    summary[mode]["mse_sum"] += float(np.sum(metrics["mse"] * metrics["eval_count"]))
+                    summary[mode]["mae_sum"] += float(np.sum(metrics["mae"] * metrics["eval_count"]))
+                    summary[mode]["eval_sum"] += float(np.sum(metrics["eval_count"]))
+                    summary[mode]["sample_count"] += int(len(metrics["mse"]))
+                    if batch_size is None:
+                        batch_size = len(metrics["mse"])
+
+                base_mse = batch_metrics["text_off"]["mse"]
+                base_mae = batch_metrics["text_off"]["mae"]
+                text_marks = test_batch.get("text_mark")
+                if torch.is_tensor(text_marks):
+                    text_marks = text_marks.detach().cpu().numpy()
+                else:
+                    text_marks = np.zeros(batch_size, dtype=np.int64)
+                text_window_len = test_batch.get("text_window_len")
+                if torch.is_tensor(text_window_len):
+                    text_window_len = text_window_len.detach().cpu().numpy()
+                else:
+                    text_window_len = np.zeros(batch_size, dtype=np.int64)
+                scale_code = test_batch.get("scale_code")
+                if torch.is_tensor(scale_code):
+                    scale_code = scale_code.detach().cpu().numpy()
+                else:
+                    scale_code = np.zeros(batch_size, dtype=np.int64)
+                trend_prior = test_batch.get("trend_prior")
+                if torch.is_tensor(trend_prior):
+                    trend_prior = trend_prior.detach().cpu().numpy()
+                else:
+                    trend_prior = np.zeros((batch_size, 3), dtype=np.float32)
+                scale_pref = test_batch.get("scale_pref")
+                if torch.is_tensor(scale_pref):
+                    scale_pref = scale_pref.detach().cpu().numpy()
+                else:
+                    scale_pref = np.zeros(batch_size, dtype=np.float32)
+                signed_slope = test_batch.get("signed_slope")
+                if torch.is_tensor(signed_slope):
+                    signed_slope = signed_slope.detach().cpu().numpy()
+                else:
+                    signed_slope = np.zeros(batch_size, dtype=np.float32)
+                abs_slope = test_batch.get("abs_slope")
+                if torch.is_tensor(abs_slope):
+                    abs_slope = abs_slope.detach().cpu().numpy()
+                else:
+                    abs_slope = np.zeros(batch_size, dtype=np.float32)
+                history_std = test_batch.get("history_std")
+                if torch.is_tensor(history_std):
+                    history_std = history_std.detach().cpu().numpy()
+                else:
+                    history_std = np.zeros(batch_size, dtype=np.float32)
+                history_mean_abs = test_batch.get("history_mean_abs")
+                if torch.is_tensor(history_mean_abs):
+                    history_mean_abs = history_mean_abs.detach().cpu().numpy()
+                else:
+                    history_mean_abs = np.zeros(batch_size, dtype=np.float32)
+                history_total_shift = test_batch.get("history_total_shift")
+                if torch.is_tensor(history_total_shift):
+                    history_total_shift = history_total_shift.detach().cpu().numpy()
+                else:
+                    history_total_shift = np.zeros(batch_size, dtype=np.float32)
+                history_accel = test_batch.get("history_accel")
+                if torch.is_tensor(history_accel):
+                    history_accel = history_accel.detach().cpu().numpy()
+                else:
+                    history_accel = np.zeros(batch_size, dtype=np.float32)
+                history_smoothness = test_batch.get("history_smoothness")
+                if torch.is_tensor(history_smoothness):
+                    history_smoothness = history_smoothness.detach().cpu().numpy()
+                else:
+                    history_smoothness = np.zeros(batch_size, dtype=np.float32)
+                history_trend_score = test_batch.get("history_trend_score")
+                if torch.is_tensor(history_trend_score):
+                    history_trend_score = history_trend_score.detach().cpu().numpy()
+                else:
+                    history_trend_score = np.zeros(batch_size, dtype=np.float32)
+                history_volatility_score = test_batch.get("history_volatility_score")
+                if torch.is_tensor(history_volatility_score):
+                    history_volatility_score = history_volatility_score.detach().cpu().numpy()
+                else:
+                    history_volatility_score = np.zeros(batch_size, dtype=np.float32)
+                history_last_value = test_batch.get("history_last_value")
+                if torch.is_tensor(history_last_value):
+                    history_last_value = history_last_value.detach().cpu().numpy()
+                else:
+                    history_last_value = np.zeros(batch_size, dtype=np.float32)
+                raw_texts = test_batch.get("raw_text", ["NA"] * batch_size)
+                full_texts = test_batch.get("texts", ["NA"] * batch_size)
+                retrieved_texts = test_batch.get("retrieved_text", [""] * batch_size)
+                cot_texts = test_batch.get("cot_text", [""] * batch_size)
+                if isinstance(raw_texts, tuple):
+                    raw_texts = list(raw_texts)
+                if isinstance(full_texts, tuple):
+                    full_texts = list(full_texts)
+                if isinstance(retrieved_texts, tuple):
+                    retrieved_texts = list(retrieved_texts)
+                if isinstance(cot_texts, tuple):
+                    cot_texts = list(cot_texts)
+
+                for idx in range(batch_size):
+                    raw_token_set = _token_set(raw_texts[idx])
+                    full_token_set = _token_set(full_texts[idx])
+                    retrieved_token_set = _token_set(retrieved_texts[idx])
+                    cot_token_set = _token_set(cot_texts[idx])
+                    overlap_raw_retrieved = len(raw_token_set & retrieved_token_set)
+                    overlap_full_retrieved = len(full_token_set & retrieved_token_set)
+                    row = {
+                        "batch_no": batch_no,
+                        "sample_idx": sample_offset + idx,
+                        "text_mark": int(text_marks[idx]),
+                        "text_window_len": int(text_window_len[idx]) if len(text_window_len) > idx else 0,
+                        "scale_code": int(scale_code[idx]) if len(scale_code) > idx else 0,
+                        "scale_pref": float(scale_pref[idx]) if len(scale_pref) > idx else 0.0,
+                        "signed_slope": float(signed_slope[idx]) if len(signed_slope) > idx else 0.0,
+                        "abs_slope": float(abs_slope[idx]) if len(abs_slope) > idx else 0.0,
+                        "history_std": float(history_std[idx]) if len(history_std) > idx else 0.0,
+                        "history_mean_abs": float(history_mean_abs[idx]) if len(history_mean_abs) > idx else 0.0,
+                        "history_total_shift": float(history_total_shift[idx]) if len(history_total_shift) > idx else 0.0,
+                        "history_accel": float(history_accel[idx]) if len(history_accel) > idx else 0.0,
+                        "history_smoothness": float(history_smoothness[idx]) if len(history_smoothness) > idx else 0.0,
+                        "history_trend_score": float(history_trend_score[idx]) if len(history_trend_score) > idx else 0.0,
+                        "history_volatility_score": float(history_volatility_score[idx]) if len(history_volatility_score) > idx else 0.0,
+                        "history_last_value": float(history_last_value[idx]) if len(history_last_value) > idx else 0.0,
+                        "raw_text_len": len(str(raw_texts[idx]).split()),
+                        "full_text_len": len(str(full_texts[idx]).split()),
+                        "retrieved_text_len": len(str(retrieved_texts[idx]).split()),
+                        "cot_text_len": len(str(cot_texts[idx]).split()),
+                        "extra_text_len": max(len(str(full_texts[idx]).split()) - len(str(raw_texts[idx]).split()), 0),
+                        "retrieval_to_raw_len_ratio": _safe_ratio(len(str(retrieved_texts[idx]).split()), len(str(raw_texts[idx]).split())),
+                        "cot_to_full_len_ratio": _safe_ratio(len(str(cot_texts[idx]).split()), len(str(full_texts[idx]).split())),
+                        "raw_retrieved_overlap": float(overlap_raw_retrieved),
+                        "full_retrieved_overlap": float(overlap_full_retrieved),
+                        "raw_retrieved_jaccard": _safe_ratio(overlap_raw_retrieved, len(raw_token_set | retrieved_token_set)),
+                        "full_retrieved_jaccard": _safe_ratio(overlap_full_retrieved, len(full_token_set | retrieved_token_set)),
+                        "retrieved_unique_ratio": _safe_ratio(len(retrieved_token_set), len(str(retrieved_texts[idx]).split())),
+                        "full_unique_ratio": _safe_ratio(len(full_token_set), len(str(full_texts[idx]).split())),
+                        "cot_unique_ratio": _safe_ratio(len(cot_token_set), len(str(cot_texts[idx]).split())),
+                        "trend_direction": float(trend_prior[idx][0]) if len(trend_prior) > idx else 0.0,
+                        "trend_strength": float(trend_prior[idx][1]) if len(trend_prior) > idx else 0.0,
+                        "trend_volatility": float(trend_prior[idx][2]) if len(trend_prior) > idx else 0.0,
+                        "guide_w": float(guide_w),
+                        "mse_text_off": float(base_mse[idx]),
+                        "mae_text_off": float(base_mae[idx]),
+                    }
+                    for mode in ordered_modes:
+                        if mode == "text_off":
+                            continue
+                        row[f"mse_{mode}"] = float(batch_metrics[mode]["mse"][idx])
+                        row[f"mae_{mode}"] = float(batch_metrics[mode]["mae"][idx])
+                        row[f"delta_mse_{mode}"] = float(base_mse[idx] - batch_metrics[mode]["mse"][idx])
+                        row[f"delta_mae_{mode}"] = float(base_mae[idx] - batch_metrics[mode]["mae"][idx])
+                    rows.append(row)
+                sample_offset += batch_size
+
+                display = {"batch_no": batch_no}
+                for mode in ordered_modes:
+                    denom = max(summary[mode]["eval_sum"], 1e-8)
+                    display[f"mse_{mode}"] = summary[mode]["mse_sum"] / denom
+                it.set_postfix(ordered_dict=display, refresh=True)
+
+    results = {
+        "split": split,
+        "guide_w": guide_w,
+        "modes": ordered_modes,
+        "summary": {},
+        "grouped_summary": {},
+    }
+    for mode in ordered_modes:
+        denom = max(summary[mode]["eval_sum"], 1e-8)
+        results["summary"][mode] = {
+            "MSE": float(summary[mode]["mse_sum"] / denom),
+            "MAE": float(summary[mode]["mae_sum"] / denom),
+            "sample_count": int(summary[mode]["sample_count"]),
+        }
+    baseline_rows = rows
+    for mode in ordered_modes:
+        if mode == "text_off":
+            continue
+        delta_mse = [row[f"delta_mse_{mode}"] for row in baseline_rows]
+        delta_mae = [row[f"delta_mae_{mode}"] for row in baseline_rows]
+        results["summary"][mode]["delta_vs_text_off"] = {
+            "mean_delta_mse": float(np.mean(delta_mse)) if delta_mse else 0.0,
+            "mean_delta_mae": float(np.mean(delta_mae)) if delta_mae else 0.0,
+            "positive_gain_rate": float(np.mean(np.asarray(delta_mse) > 0.0)) if delta_mse else 0.0,
+            "negative_gain_rate": float(np.mean(np.asarray(delta_mse) < 0.0)) if delta_mse else 0.0,
+        }
+
+    if rows:
+        for group_key in ["text_mark", "text_window_len", "scale_code"]:
+            results["grouped_summary"][group_key] = _summarize_counterfactual_groups(rows, ordered_modes, group_key)
+
+    if foldername:
+        metrics_prefix = "eval" if split == "test" else split
+        guide_tag = str(guide_w).replace("-", "m").replace(".", "p")
+        json_path = os.path.join(foldername, f"{metrics_prefix}_counterfactual_guide_{guide_tag}.json")
+        csv_path = os.path.join(foldername, f"{metrics_prefix}_counterfactual_samples_guide_{guide_tag}.csv")
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=4)
+        if rows:
+            fieldnames = list(rows[0].keys())
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    print("Counterfactual summary:", json.dumps(results, ensure_ascii=True))
+    return results
 
 def evaluate(
     model,

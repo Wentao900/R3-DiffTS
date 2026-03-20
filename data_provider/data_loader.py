@@ -178,8 +178,19 @@ class Dataset_Custom(Dataset):
                 'scale_pref': 0.5,
                 'scale_label': 'mid',
                 'text_len': int(self.dynamic_text_lens[min(len(self.dynamic_text_lens) - 1, 0)]),
+                'signed_slope': 0.0,
+                'abs_slope': 0.0,
+                'std': 0.0,
+                'mean_abs': 0.0,
+                'total_shift': 0.0,
+                'accel': 0.0,
+                'smoothness': 1.0,
+                'trend_score': 0.0,
+                'volatility_score': 0.0,
+                'last_value': 0.0,
             }
-        slope = float(abs(arr[-1] - arr[0]) / max(arr.size - 1, 1))
+        signed_slope = float((arr[-1] - arr[0]) / max(arr.size - 1, 1))
+        slope = float(abs(signed_slope))
         std = float(np.std(arr))
         mean_abs = float(np.mean(np.abs(arr)))
         total_shift = float(abs(arr[-1] - arr[0]))
@@ -210,6 +221,16 @@ class Dataset_Custom(Dataset):
             'scale_pref': scale_pref,
             'scale_label': scale_label,
             'text_len': int(self.dynamic_text_lens[scale_index]),
+            'signed_slope': signed_slope,
+            'abs_slope': slope,
+            'std': std,
+            'mean_abs': mean_abs,
+            'total_shift': total_shift,
+            'accel': accel,
+            'smoothness': smoothness,
+            'trend_score': trend_score,
+            'volatility_score': volatility_score,
+            'last_value': float(arr[-1]),
         }
 
 
@@ -305,13 +326,15 @@ class Dataset_Custom(Dataset):
 
     def _build_guided_text(self, index, seq_x, text_begin, text_end, scale_label, text_dropped=False):
         if text_dropped:
+            raw_text, raw_text_mark = 'NA', 0
             seq_x_txt, txt_mark = 'NA', 0
             rag_retrieved, cot_text = '', ''
         else:
-            seq_x_txt, txt_mark = self.collect_text(
+            raw_text, raw_text_mark = self.collect_text(
                 self.num_dates.start_date[text_begin],
                 self.num_dates.end_date[text_end],
             )
+            seq_x_txt, txt_mark = raw_text, raw_text_mark
             rag_retrieved, cot_text = '', ''
             if self.use_rag_cot and self.rag_cot is not None:
                 cached = self.guidance_cache.get(index, None)
@@ -334,7 +357,7 @@ class Dataset_Custom(Dataset):
             txt_mark = 0
         trend_fields = build_trend_fields(cot_text, seq_x)
         trend_prior = trend_fields_to_vector(trend_fields).astype(np.float32)
-        return seq_x_txt, np.int64(txt_mark), cot_text, rag_retrieved, trend_prior
+        return raw_text, np.int64(raw_text_mark), seq_x_txt, np.int64(txt_mark), cot_text, rag_retrieved, trend_prior
     
     def __getitem__(self, index):
         s_begin = index
@@ -358,7 +381,7 @@ class Dataset_Custom(Dataset):
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
             text_dropped = True
-        seq_x_txt, txt_mark, cot_text, rag_retrieved, trend_prior = self._build_guided_text(
+        raw_text, raw_text_mark, seq_x_txt, txt_mark, cot_text, rag_retrieved, trend_prior = self._build_guided_text(
             index=index,
             seq_x=seq_x,
             text_begin=text_begin,
@@ -379,12 +402,25 @@ class Dataset_Custom(Dataset):
             'timepoints': np.arange(self.seq_len + self.pred_len).astype(np.float32), 
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
+            'raw_text': raw_text,
+            'raw_text_mark': raw_text_mark,
             'texts': seq_x_txt,
             'text_mark': txt_mark,
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior,
             'scale_code': np.int64({'short': 0, 'mid': 1, 'long': 2}.get(scale_label, 1)),
+            'scale_pref': np.float32(scale_profile['scale_pref']),
+            'signed_slope': np.float32(scale_profile['signed_slope']),
+            'abs_slope': np.float32(scale_profile['abs_slope']),
+            'history_std': np.float32(scale_profile['std']),
+            'history_mean_abs': np.float32(scale_profile['mean_abs']),
+            'history_total_shift': np.float32(scale_profile['total_shift']),
+            'history_accel': np.float32(scale_profile['accel']),
+            'history_smoothness': np.float32(scale_profile['smoothness']),
+            'history_trend_score': np.float32(scale_profile['trend_score']),
+            'history_volatility_score': np.float32(scale_profile['volatility_score']),
+            'history_last_value': np.float32(scale_profile['last_value']),
             'text_window_len': np.int64(effective_text_len),
         }
 

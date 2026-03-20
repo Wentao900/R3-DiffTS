@@ -9,7 +9,7 @@ import random
 
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
-from utils.utils import train, evaluate
+from utils.utils import train, evaluate, evaluate_counterfactual
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
@@ -54,6 +54,12 @@ parser.add_argument('--trend_strength_scale', type=float, default=1.0, help='aff
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='scale for trend volatility in 1/(1+v*vol) penalty')
 parser.add_argument('--trend_time_floor', type=float, default=0.0, help='minimum value added to trend time schedule')
 parser.add_argument('--save_trend_prior', action='store_true', help='save per-sample trend priors during evaluation')
+parser.add_argument('--counterfactual_eval', action='store_true', help='run text counterfactual evaluation on the test split')
+parser.add_argument('--counterfactual_modes', nargs='*', default=None, help='counterfactual modes, e.g. text_off raw_only full_text')
+parser.add_argument('--use_text_score_gate', action='store_true', help='enable online gating from an offline-fitted text score model')
+parser.add_argument('--text_score_model_path', type=str, default=None, help='path to fitted text score json produced by scripts/fit_text_score.py')
+parser.add_argument('--text_score_gate_strength', type=float, default=1.0, help='blend strength for text score gate in [0,1]')
+parser.add_argument('--text_score_gate_floor', type=float, default=0.0, help='minimum retained text gate when score is low')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
 parser.add_argument('--freq', type=str, default='m', help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -164,6 +170,10 @@ args.trend_strength_scale = config["diffusion"].get("trend_strength_scale", args
 args.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", args.trend_volatility_scale)
 args.trend_time_floor = config["diffusion"].get("trend_time_floor", args.trend_time_floor)
 args.save_trend_prior = config["model"].get("save_trend_prior", args.save_trend_prior)
+args.use_text_score_gate = config["model"].get("use_text_score_gate", args.use_text_score_gate)
+args.text_score_model_path = config["model"].get("text_score_model_path", args.text_score_model_path)
+args.text_score_gate_strength = config["model"].get("text_score_gate_strength", args.text_score_gate_strength)
+args.text_score_gate_floor = config["model"].get("text_score_gate_floor", args.text_score_gate_floor)
 if args.embed == 'timeF':
     if config["model"]["timestep_branch"] or config["model"]["timestep_emb_cat"]:
         config["model"]["timestep_dim"] = timestep_dim_dict[args.freq] + extra_timestep_dims
@@ -211,6 +221,10 @@ config["model"]["cot_device"] = args.cot_device
 config["model"]["cot_load_in_8bit"] = args.cot_load_in_8bit
 config["model"]["cot_load_in_4bit"] = args.cot_load_in_4bit
 config["model"]["save_trend_prior"] = args.save_trend_prior
+config["model"]["use_text_score_gate"] = args.use_text_score_gate
+config["model"]["text_score_model_path"] = args.text_score_model_path
+config["model"]["text_score_gate_strength"] = args.text_score_gate_strength
+config["model"]["text_score_gate_floor"] = args.text_score_gate_floor
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
@@ -332,6 +346,19 @@ if config["diffusion"]["cfg"]:
         split="test",
         append_to_config_results=True,
     )
+    if args.counterfactual_eval:
+        evaluate_counterfactual(
+            model,
+            test_loader,
+            nsample=args.nsample,
+            scaler=scaler,
+            mean_scaler=mean_scaler,
+            foldername=foldername,
+            model_folder=model_folder,
+            guide_w=selected_guide_w,
+            split="test",
+            modes=args.counterfactual_modes,
+        )
 else:
     evaluate(
             model,
@@ -348,4 +375,17 @@ else:
             save_trend_prior=args.save_trend_prior,
             split="test",
             append_to_config_results=True,
+        )
+    if args.counterfactual_eval:
+        evaluate_counterfactual(
+            model,
+            test_loader,
+            nsample=args.nsample,
+            scaler=scaler,
+            mean_scaler=mean_scaler,
+            foldername=foldername,
+            model_folder=model_folder,
+            guide_w=0.0,
+            split="test",
+            modes=args.counterfactual_modes,
         )
